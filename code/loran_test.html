@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <title>LORAN - Позиціонування об'єкта</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #1e1e2f;
+            color: #ffcc00;
+        }
+        header {
+            background-color: #27293d;
+            padding: 20px;
+            text-align: center;
+        }
+        #plot {
+            width: 80%;
+            height: 600px;
+            margin: 20px auto;
+            background-color: #27293d;
+            border-radius: 10px;
+        }
+        #config-form {
+            width: 80%;
+            margin: 20px auto;
+            background-color: #2e2e3e;
+            padding: 20px;
+            border-radius: 8px;
+        }
+        label, input, button {
+            display: block;
+            margin: 10px 0;
+        }
+        input {
+            width: 100%;
+            padding: 8px;
+            border-radius: 4px;
+            background-color: #3b3b4f;
+            color: #ffffff;
+            border: none;
+        }
+        button {
+            background-color: #ffcc00;
+            padding: 10px;
+            border-radius: 4px;
+            border: none;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        @media (max-width: 768px) {
+            #plot, #config-form {
+                width: 95%;
+            }
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>Візуалізація LORAN - Позиціонування об'єкта</h1>
+</header>
+
+<div id="plot"></div>
+
+<div id="config-form">
+    <h3>Налаштування швидкості об'єкта</h3>
+    <label for="objectSpeed">Швидкість об'єкта (км/год):</label>
+    <input type="number" id="objectSpeed" value="100">
+    <button onclick="updateObjectSpeed()">Оновити швидкість</button>
+</div>
+
+<script>
+    const socket = new WebSocket('ws://localhost:4002');
+
+    const baseStationPositions = {
+        'source1': { x: 0, y: 0 }, 
+        'source2': { x: 100, y: 0 },
+        'source3': { x: 0, y: 100 }
+    };
+
+    let objectPosition = null;
+    let baseStations = {};
+
+    const layout = {
+        xaxis: { title: 'X (км)', range: [-50, 150] },
+        yaxis: { title: 'Y (км)', range: [-50, 150] },
+        plot_bgcolor: '#27293d',
+        paper_bgcolor: '#1e1e2f',
+        showlegend: true,
+    };
+
+    Plotly.newPlot('plot', [], layout);
+
+    socket.onopen = () => console.log('Підключено до WebSocket сервера');
+
+    socket.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        console.log('Отримані дані:', data);
+        processData(data);
+    };
+
+    socket.onclose = () => console.log('З\'єднання закрито');
+    socket.onerror = (error) => console.error('Помилка WebSocket:', error);
+
+    function processData(data) {
+        const { id, sourceId, receivedAt } = data;
+
+        if (!baseStations[id]) baseStations[id] = {};
+        baseStations[id][sourceId] = receivedAt;
+
+        if (Object.keys(baseStations[id]).length >= 3) {
+            calculateObjectPosition(baseStations[id]);
+            updatePlot();
+            delete baseStations[id];
+        }
+    }
+
+    function tdoaError(params, x1, y1, x2, y2, x3, y3, delta_t12, delta_t13, c) {
+        const [x, y] = params;
+
+        const d1 = Math.sqrt((x - x1) ** 2 + (y - y1) ** 2);
+        const d2 = Math.sqrt((x - x2) ** 2 + (y - y2) ** 2);
+        const d3 = Math.sqrt((x - x3) ** 2 + (y - y3) ** 2);
+
+        const delta_t12_calc = (d2 - d1) / c;
+        const delta_t13_calc = (d3 - d1) / c;
+
+        return [delta_t12_calc - delta_t12, delta_t13_calc - delta_t13];
+    }
+
+    function lossFunction(params, tdoaErrorFunc, args) {
+        const errors = tdoaErrorFunc(params, ...args);
+        return errors.reduce((sum, e) => sum + e ** 2, 0);
+    }
+
+    function customLeastSquares(tdoaErrorFunc, initialGuess, args, learningRate = 0.01, maxIterations = 10000, tolerance = 1e-12) {
+        let [x, y] = initialGuess;
+        let iteration = 0;
+        let prevLoss = Infinity;
+
+        while (iteration < maxIterations) {
+            const loss = lossFunction([x, y], tdoaErrorFunc, args);
+
+            if (Math.abs(prevLoss - loss) < tolerance) {
+                console.log('Exit:', prevLoss - loss);
+                break;
+            }
+
+            prevLoss = loss;
+
+            const delta = 1e-6;
+            const lossX = lossFunction([x + delta, y], tdoaErrorFunc, args);
+            const gradX = (lossX - loss) / delta;
+
+            const lossY = lossFunction([x, y + delta], tdoaErrorFunc, args);
+            const gradY = (lossY - loss) / delta;
+
+            x -= learningRate * gradX;
+            y -= learningRate * gradY;
+
+            iteration++;
+        }
+
+        return [x, y, iteration];
+    }
+
+    function calculateObjectPosition(times) {
+        const t1 = times['source1'];
+        const t2 = times['source2'];
+        const t3 = times['source3'];
+
+        const delta_t12 = (t2 - t1) * 1e3;
+        const delta_t13 = (t3 - t1) * 1e3;
+        const c = 0.299792458;
+
+        const [x1, y1] = [baseStationPositions['source1'].x, baseStationPositions['source1'].y];
+        const [x2, y2] = [baseStationPositions['source2'].x, baseStationPositions['source2'].y];
+        const [x3, y3] = [baseStationPositions['source3'].x, baseStationPositions['source3'].y];
+
+        const initialGuess = [(x1 + x2 + x3) / 3, (y1 + y2 + y3) / 3];
+
+        const [xOpt, yOpt, iterations] = customLeastSquares(
+            tdoaError,
+            initialGuess,
+            [x1, y1, x2, y2, x3, y3, delta_t12, delta_t13, c]
+        );
+
+        objectPosition = { x: xOpt, y: yOpt };
+        console.log(`Розрахована позиція об'єкта: x = ${xOpt.toFixed(2)}, y = ${yOpt.toFixed(2)} за ${iterations} ітерацій`);
+    }
+
+    function updatePlot() {
+        const traces = Object.entries(baseStationPositions).map(([id, pos]) => ({
+            x: [pos.x], y: [pos.y], mode: 'markers', name: `Станція ${id}`,
+            marker: { size: 12, color: 'red' }
+        }));
+
+        if (objectPosition) {
+            traces.push({
+                x: [objectPosition.x], y: [objectPosition.y], mode: 'markers', name: 'Об\'єкт',
+                marker: { size: 12, color: 'blue' }
+            });
+        }
+
+        Plotly.react('plot', traces, layout);
+    }
+
+    function updateObjectSpeed() {
+        const speed = parseInt(document.getElementById('objectSpeed').value);
+        fetch('http://localhost:4002/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ objectSpeed: speed })
+        }).then(res => res.json())
+          .then(data => alert('Швидкість оновлена!'))
+          .catch(err => alert('Помилка оновлення швидкості.'));
+    }
+</script>
+
+</body>
+</html>
